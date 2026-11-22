@@ -407,128 +407,6 @@ def configure_webkit_settings(webview):
     settings.set_enable_developer_extras(True)
 
 
-class ReaderPopupWindow(Gtk.Window):
-    """웹뷰어 [바로보기] 클릭 시 열리는 독서 전용 팝업 창."""
-
-    def __init__(self, parent_window, related_view):
-        super().__init__(title=f"{APP_TITLE} — 독서 창")
-        self.parent_window = parent_window
-        self.is_fullscreen = False
-        self.toolbar_visible = True
-
-        self.set_default_size(1100, 820)
-        self._apply_icon()
-
-        self.webview = WebKit2.WebView.new_with_related_view(related_view)
-        configure_webkit_settings(self.webview)
-        self.webview.set_zoom_level(parent_window.settings.get("zoom", 1.0))
-
-        self.header = Gtk.HeaderBar()
-        self.header.set_show_close_button(True)
-        self.header.set_title("독서 창")
-        self.set_titlebar(self.header)
-
-        # 테마 선택
-        self.theme_combo = Gtk.ComboBoxText()
-        for key, label in THEME_LABELS.items():
-            self.theme_combo.append(key, label)
-        self.theme_combo.set_active_id(parent_window.current_theme)
-        self.theme_combo.connect("changed", self.on_theme_changed)
-        self.header.pack_start(self.theme_combo)
-
-        # Chrome 앱으로 열기 버튼
-        chrome_btn = Gtk.Button(label="Chrome 앱")
-        chrome_btn.set_tooltip_text("현재 웹뷰어를 독립 Chrome 앱 창으로 열기")
-        chrome_btn.connect("clicked", self.on_open_chrome)
-        self.header.pack_end(chrome_btn)
-
-        # 전체화면 버튼
-        fs_btn = Gtk.Button.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON)
-        fs_btn.set_tooltip_text("전체 화면 (F11)")
-        fs_btn.connect("clicked", lambda *_: self.toggle_fullscreen())
-        self.header.pack_end(fs_btn)
-
-        self.add(self.webview)
-
-        self.webview.connect("ready-to-show", self.on_ready_to_show)
-        self.webview.connect("notify::title", self.on_title_changed)
-        self.webview.connect("close", lambda *_: self.destroy())
-        self.webview.connect("load-changed", self.on_load_changed)
-        self.webview.connect("create", self.on_create_popup)
-        self.connect("key-press-event", self.on_key_press)
-
-    def on_create_popup(self, webview, _navigation_action):
-        popup = ReaderPopupWindow(self.parent_window, webview)
-        return popup.webview
-
-    def _apply_icon(self):
-        icon_path = Path(__file__).resolve().parent / "icon.svg"
-        if icon_path.exists():
-            try:
-                self.set_icon_from_file(str(icon_path))
-            except Exception:
-                pass
-
-    def on_ready_to_show(self, _webview):
-        self.show_all()
-
-    def on_title_changed(self, webview, _param):
-        title = webview.get_title() or "독서 창"
-        self.header.set_title(title)
-        self.set_title(title)
-
-    def on_load_changed(self, _webview, event):
-        if event in (WebKit2.LoadEvent.COMMITTED, WebKit2.LoadEvent.FINISHED):
-            self.apply_theme(self.theme_combo.get_active_id() or "normal")
-
-    def on_theme_changed(self, combo):
-        self.apply_theme(combo.get_active_id() or "normal")
-
-    def apply_theme(self, theme_id):
-        css = THEME_STYLES.get(theme_id, "")
-        js = f"""
-        (function() {{
-            let el = document.getElementById('__kyobo_linux_theme');
-            if (!el) {{
-                el = document.createElement('style');
-                el.id = '__kyobo_linux_theme';
-                (document.head || document.documentElement).appendChild(el);
-            }}
-            el.textContent = {json.dumps(css)};
-        }})();
-        """
-        run_js(self.webview, js)
-
-    def toggle_fullscreen(self):
-        if self.is_fullscreen:
-            self.unfullscreen()
-            self.is_fullscreen = False
-        else:
-            self.fullscreen()
-            self.is_fullscreen = True
-
-    def on_open_chrome(self, _btn):
-        uri = self.webview.get_uri()
-        if uri and uri.startswith(("http://", "https://")):
-            self.parent_window.launch_chrome_app(uri)
-
-    def on_key_press(self, _widget, event):
-        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
-        if event.keyval == Gdk.KEY_F11:
-            self.toggle_fullscreen()
-            return True
-        if ctrl and event.keyval in (Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add):
-            self.webview.set_zoom_level(min(2.5, self.webview.get_zoom_level() + 0.1))
-            return True
-        if ctrl and event.keyval in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
-            self.webview.set_zoom_level(max(0.5, self.webview.get_zoom_level() - 0.1))
-            return True
-        if ctrl and event.keyval == Gdk.KEY_0:
-            self.webview.set_zoom_level(1.0)
-            return True
-        return False
-
-
 class KyoboViewerWindow(Gtk.ApplicationWindow):
     def __init__(self, app, start_url=None):
         super().__init__(application=app, title=APP_TITLE)
@@ -537,6 +415,8 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
         self.current_theme = self.settings.get("theme", "normal")
         self.is_fullscreen = False
         self.toolbar_visible = True
+        self._view_seq = 0
+        self.views = []
 
         self.set_default_size(
             int(self.settings.get("width", 1220)),
@@ -549,10 +429,6 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
         self._cookie_save_timer = None
         self.cookie_manager.connect("changed", self.on_cookies_changed)
 
-        self.webview = WebKit2.WebView.new_with_context(self.web_context)
-        configure_webkit_settings(self.webview)
-        self.webview.set_zoom_level(float(self.settings.get("zoom", 1.0)))
-
         # 레이아웃
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(root)
@@ -563,8 +439,8 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
         root.pack_start(self.toolbar, False, False, 0)
 
         self.back_btn = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
-        self.back_btn.set_tooltip_text("뒤로 (Alt+←)")
-        self.back_btn.connect("clicked", lambda *_: self.webview.go_back())
+        self.back_btn.set_tooltip_text("뒤로 / 이전 서재로 돌아가기 (Alt+←)")
+        self.back_btn.connect("clicked", lambda *_: self.go_back_action())
         self.toolbar.pack_start(self.back_btn, False, False, 0)
 
         self.fwd_btn = Gtk.Button.new_from_icon_name("go-next-symbolic", Gtk.IconSize.BUTTON)
@@ -620,15 +496,14 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
         self.progress.set_no_show_all(True)
         root.pack_start(self.progress, False, False, 0)
 
-        # 웹뷰 본문
-        root.pack_start(self.webview, True, True, 0)
+        # 본 프로그램 내부 뷰 스택 (바로보기/새 창도 같은 창 안에서 전환)
+        self.view_stack = Gtk.Stack()
+        self.view_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        root.pack_start(self.view_stack, True, True, 0)
 
-        # 시그널 연결
-        self.webview.connect("load-changed", self.on_load_changed)
-        self.webview.connect("notify::estimated-load-progress", self.on_progress_changed)
-        self.webview.connect("notify::uri", self.on_uri_changed)
-        self.webview.connect("notify::title", self.on_title_changed)
-        self.webview.connect("create", self.on_create_popup)
+        self.main_webview = WebKit2.WebView.new_with_context(self.web_context)
+        self._attach_webview(self.main_webview, switch_now=True)
+
         self.connect("key-press-event", self.on_key_press)
         self.connect("delete-event", self.on_close)
 
@@ -636,6 +511,69 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
             self.navigate(start_url)
         else:
             self.load_home()
+
+    @property
+    def webview(self):
+        return self.views[-1]
+
+    def _attach_webview(self, view, switch_now=False):
+        configure_webkit_settings(view)
+        view.set_zoom_level(float(self.settings.get("zoom", 1.0)))
+        view.connect("load-changed", self.on_load_changed)
+        view.connect("notify::estimated-load-progress", self.on_progress_changed)
+        view.connect("notify::uri", self.on_uri_changed)
+        view.connect("notify::title", self.on_title_changed)
+        view.connect("create", self.on_create_popup)
+        view.connect("close", self.on_webview_close)
+
+        self._view_seq += 1
+        view_name = f"view-{self._view_seq}"
+        self.view_stack.add_named(view, view_name)
+        view.show()
+        self.views.append(view)
+        if switch_now:
+            self.view_stack.set_visible_child(view)
+            self._sync_ui_for_active_view()
+
+    def _sync_ui_for_active_view(self):
+        view = self.webview
+        uri = view.get_uri() or ""
+        if uri.startswith("kyobo://"):
+            self.url_entry.set_text("")
+        else:
+            self.url_entry.set_text(uri)
+        title = view.get_title()
+        self.set_title(f"{title} — {APP_TITLE}" if title else APP_TITLE)
+        self.back_btn.set_sensitive(view.can_go_back() or len(self.views) > 1)
+        self.fwd_btn.set_sensitive(view.can_go_forward())
+        frac = view.get_estimated_load_progress()
+        if 0.0 < frac < 1.0:
+            self.progress.set_fraction(frac)
+            self.progress.show()
+        else:
+            self.progress.hide()
+
+    def pop_view(self, target_view=None):
+        if len(self.views) <= 1:
+            return
+        view = target_view if (target_view in self.views and target_view is not self.main_webview) else self.views[-1]
+        if view is self.main_webview:
+            return
+        self.views.remove(view)
+        self.view_stack.remove(view)
+        view.destroy()
+        self.view_stack.set_visible_child(self.webview)
+        self._sync_ui_for_active_view()
+
+    def _clear_sub_views(self):
+        while len(self.views) > 1:
+            self.pop_view(self.views[-1])
+
+    def go_back_action(self):
+        if self.webview.can_go_back():
+            self.webview.go_back()
+        elif len(self.views) > 1:
+            self.pop_view(self.webview)
 
     def _apply_icon(self):
         icon_path = Path(__file__).resolve().parent / "icon.svg"
@@ -646,9 +584,10 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
                 pass
 
     def load_home(self):
+        self._clear_sub_views()
         self.bookmarks = load_bookmarks()
         html = build_home_html(self.bookmarks)
-        self.webview.load_html(html, "kyobo://home")
+        self.main_webview.load_html(html, "kyobo://home")
         self.url_entry.set_text("")
         self.set_title(APP_TITLE)
 
@@ -667,19 +606,19 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
         self.navigate(entry.get_text())
 
     def on_uri_changed(self, webview, _param):
-        uri = webview.get_uri() or ""
-        if uri.startswith("kyobo://"):
-            self.url_entry.set_text("")
-        else:
-            self.url_entry.set_text(uri)
-        self.back_btn.set_sensitive(webview.can_go_back())
-        self.fwd_btn.set_sensitive(webview.can_go_forward())
+        if webview is not self.webview:
+            return
+        self._sync_ui_for_active_view()
 
     def on_title_changed(self, webview, _param):
+        if webview is not self.webview:
+            return
         title = webview.get_title()
         self.set_title(f"{title} — {APP_TITLE}" if title else APP_TITLE)
 
     def on_progress_changed(self, webview, _param):
+        if webview is not self.webview:
+            return
         frac = webview.get_estimated_load_progress()
         if 0.0 < frac < 1.0:
             self.progress.set_fraction(frac)
@@ -687,23 +626,37 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
         else:
             self.progress.hide()
 
-    def on_load_changed(self, _webview, event):
+    def on_load_changed(self, webview, event):
         if event in (WebKit2.LoadEvent.COMMITTED, WebKit2.LoadEvent.FINISHED):
-            self.apply_theme(self.current_theme)
-            self.back_btn.set_sensitive(self.webview.can_go_back())
-            self.fwd_btn.set_sensitive(self.webview.can_go_forward())
+            self.apply_theme(self.current_theme, target_view=webview)
+            if webview is self.webview:
+                self._sync_ui_for_active_view()
 
-    def on_create_popup(self, webview, _navigation_action):
-        popup = ReaderPopupWindow(self, webview)
-        return popup.webview
+    def on_create_popup(self, parent_webview, _navigation_action):
+        child = WebKit2.WebView.new_with_related_view(parent_webview)
+        self._attach_webview(child, switch_now=False)
+
+        def _on_ready(_view):
+            if child in self.views:
+                self.view_stack.set_visible_child(child)
+                self._sync_ui_for_active_view()
+
+        child.connect("ready-to-show", _on_ready)
+        return child
+
+    def on_webview_close(self, webview):
+        if webview is not self.main_webview:
+            self.pop_view(webview)
 
     def on_theme_changed(self, combo):
         self.current_theme = combo.get_active_id() or "normal"
         self.settings["theme"] = self.current_theme
         save_settings(self.settings)
-        self.apply_theme(self.current_theme)
+        for view in self.views:
+            self.apply_theme(self.current_theme, target_view=view)
 
-    def apply_theme(self, theme_id):
+    def apply_theme(self, theme_id, target_view=None):
+        view = target_view or self.webview
         css = THEME_STYLES.get(theme_id, "")
         js = f"""
         (function() {{
@@ -716,7 +669,7 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
             el.textContent = {json.dumps(css)};
         }})();
         """
-        run_js(self.webview, js)
+        run_js(view, js)
 
     def on_add_bookmark(self, _btn):
         dialog = Gtk.Dialog(
@@ -855,7 +808,7 @@ class KyoboViewerWindow(Gtk.ApplicationWindow):
             self.settings["zoom"] = 1.0
             return True
         if alt and event.keyval == Gdk.KEY_Left:
-            self.webview.go_back()
+            self.go_back_action()
             return True
         if alt and event.keyval == Gdk.KEY_Right:
             self.webview.go_forward()
